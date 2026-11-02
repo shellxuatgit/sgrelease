@@ -1,0 +1,180 @@
+name: Build the three installers and upload them to R2
+
+# This repository is PUBLIC on purpose: standard GitHub-hosted runners are free
+# for public repositories, and a macOS runner costs 10x the Linux rate on a
+# private one (~400 billed minutes per release). The code stays private — this
+# workflow checks it out with a read-only token and builds it.
+#
+# Three rules that come with a public repository:
+#
+#   1. workflow_dispatch only. No push, no pull_request: a fork PR would
+#      otherwise run this file, and every run here holds the private-repo token.
+#   2. No tests, no coverage, no debug output. A failing test prints source
+#      excerpts into a log the whole world can read. The test gate runs locally
+#      (scripts/release.mjs) before a version is cut.
+#   3. Nothing is published here. The upload writes artifacts and a manifest;
+#      flipping the pointers users actually follow stays a local, human step.
+#
+# Secrets and variables to configure (Settings -> Secrets and variables -> Actions):
+#
+#   secrets.SG_REPO_TOKEN          fine-grained PAT, repository shellxuatgit/salesgraph,
+#                                  permission Contents: Read-only, <= 90 days
+#   secrets.CLOUDFLARE_API_TOKEN   Account: Workers R2 Storage: Edit
+#   vars.SG_REPO                   shellxuatgit/salesgraph
+#
+# After a green run:
+#   node scripts/publish-release.mjs --version X --promote     (in the private repo)
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to build (the private repo must have tag v<version>)'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  R2_BUCKET: salesgraph-releases
+  CLOUDFLARE_ACCOUNT_ID: 336975f3d60b4d7692ba2736c854c7d6
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows installer (NSIS)
+            os: windows-latest
+            platform: win
+          - name: macOS disk image (Apple Silicon)
+            os: macos-15
+            platform: mac
+            arch: arm64
+          - name: macOS disk image (Intel)
+            os: macos-15-intel
+            platform: mac
+            arch: x64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Check out the private source at the version tag
+        # The ref is the TAG, not the branch: a version must be reproducible, and
+        # the tag is what "1.0.3" means. persist-credentials: false keeps the
+        # token out of .git/config where later steps could print it.
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.SG_REPO }}
+          ref: v${{ inputs.version }}
+          token: ${{ secrets.SG_REPO_TOKEN }}
+          persist-credentials: false
+          path: src
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: npm 11
+        # npm 10 runs an implicit `node-gyp rebuild` for any package with a
+        # binding.gyp; better-sqlite3 has one and ships prebuilds instead.
+        run: npm install -g npm@11
+
+      - name: The tag must be the version we were asked for
+        working-directory: src/client
+        shell: bash
+        run: |
+          want="${{ inputs.version }}"
+          got=$(node -p "require('./package.json').version")
+          echo "package.json says $got, the run asked for $want"
+          test "$got" = "$want"
+
+      - name: The runner must be the architecture we are packaging
+        if: matrix.platform == 'mac'
+        working-directory: src/client
+        shell: bash
+        run: |
+          want="${{ matrix.arch }}"
+          got=$(node -p "process.arch")
+          echo "runner arch: $got (want $want)"
+          test "$got" = "$want"
+
+      - working-directory: src/client
+        run: npm ci
+      - working-directory: src/client/agent-server
+        run: npm ci
+
+      - name: Build the agent-server (it ships INSIDE the app)
+        working-directory: src/client
+        run: npm run build:agent-server
+
+      - name: Build the installer
+        working-directory: src/client
+        shell: bash
+        run: |
+          if [ "${{ matrix.platform }}" = "win" ]; then
+            npm run dist:win
+          else
+            npm run dist:mac
+          fi
+
+      - name: Collect exactly what ships
+        # The top-level files only: `client/release/**` also contains
+        # win-unpacked/ (~300 MB of unpacked app, which is not a deliverable and
+        # once put 1 GB of junk on a release).
+        shell: bash
+        run: |
+          set -euo pipefail
+          V="${{ inputs.version }}"
+          mkdir -p out
+          if [ "${{ matrix.platform }}" = "win" ]; then
+            cp src/client/release/SalesGraph_${V}_x64.exe out/
+            cp src/client/release/SalesGraph_${V}_x64.exe.blockmap out/
+            cp src/client/release/latest.yml out/
+          else
+            cp src/client/release/SalesGraph_${V}_${{ matrix.arch }}.dmg out/
+            cp src/client/release/SalesGraph_${V}_${{ matrix.arch }}.dmg.blockmap out/
+          fi
+          ls -la out
+          node scripts/manifest.mjs --version "$V" --platform "${{ matrix.platform }}" \
+            --dir out --out out/manifest.json --commit "$GITHUB_SHA"
+
+      - name: Upload to R2
+        # Artifacts go in; nothing points at them yet. Flipping the pointers is
+        # the local step (`publish-release.mjs --promote`), so a green build is
+        # not a release.
+        shell: bash
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          set -euo pipefail
+          V="${{ inputs.version }}"
+          P="${{ matrix.platform }}"
+          put() {
+            case "$2" in
+              *.exe)      ct=application/vnd.microsoft.portable-executable ;;
+              *.dmg)      ct=application/x-apple-diskimage ;;
+              *.yml)      ct=text/yaml; cc=no-cache ;;
+              *.json)     ct=application/json; cc=no-cache ;;
+              *)          ct=application/octet-stream ;;
+            esac
+            npx -y wrangler@3 r2 object put "$R2_BUCKET/$P/$V/$2" \
+              --file "$1" --content-type "$ct" --cache-control "${cc:-max-age=31536000}"
+          }
+          for f in out/*; do
+            put "$f" "$(basename "$f")"
+            echo "uploaded $P/$V/$(basename "$f") ($(wc -c < "$f") bytes)"
+          done
+
+      - name: Show what the image carries (macOS branding check)
+        if: matrix.platform == 'mac'
+        working-directory: src/client
+        shell: bash
+        run: |
+          DMG=$(ls release/*.dmg | head -1)
+          MOUNT=$(hdiutil attach -nobrowse -readonly "$DMG" 2>&1 | sed -n 's|.*\(/Volumes/.*\)|\1|p' | head -1)
+          APP=$(find "$MOUNT" -maxdepth 1 -name "*.app" 2>/dev/null | head -1)
+          ls -la "$APP/Contents/Resources/" 2>/dev/null | grep -i -E "icon|icns|salesgraph-agent" || echo "(no icon or sidecar in Resources)"
+          /usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$APP/Contents/Info.plist" 2>/dev/null || true
+          /usr/libexec/PlistBuddy -c "Print :NSHumanReadableCopyright" "$APP/Contents/Info.plist" 2>/dev/null || true
+          hdiutil detach "$MOUNT" 2>/dev/null || true
