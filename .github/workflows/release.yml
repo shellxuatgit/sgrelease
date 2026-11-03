@@ -144,7 +144,8 @@ jobs:
           fi
           ls -la out
           node scripts/manifest.mjs --version "$V" --platform "${{ matrix.platform }}" \
-            --dir out --out out/manifest.json --commit "$GITHUB_SHA"
+            --dir out --commit "$GITHUB_SHA" \
+            --out "out/manifest${{ matrix.platform == 'mac' && format('-{0}', matrix.arch) || '' }}.json"
 
       - name: Upload to R2
         # Artifacts go in; nothing points at them yet. Flipping the pointers is
