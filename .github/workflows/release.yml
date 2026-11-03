@@ -60,6 +60,9 @@ jobs:
             arch: x64
     runs-on: ${{ matrix.os }}
     steps:
+      # This repository itself (for scripts/manifest.mjs). Checking out only the
+      # private source into src/ leaves the workspace without it.
+      - uses: actions/checkout@v4
       - name: Check out the private source at the version tag
         # The ref is the TAG, not the branch: a version must be reproducible, and
         # the tag is what "1.0.3" means. persist-credentials: false keeps the
@@ -130,7 +133,11 @@ jobs:
           if [ "${{ matrix.platform }}" = "win" ]; then
             cp src/client/release/SalesGraph_${V}_x64.exe out/
             cp src/client/release/SalesGraph_${V}_x64.exe.blockmap out/
-            cp src/client/release/latest.yml out/
+            # electron-builder names the channel file after the CHANNEL: a
+            # prerelease writes rc.yml, not latest.yml. Take whichever exists.
+            for c in latest rc beta alpha; do
+              if [ -f "src/client/release/$c.yml" ]; then cp "src/client/release/$c.yml" out/; break; fi
+            done
           else
             cp src/client/release/SalesGraph_${V}_${{ matrix.arch }}.dmg out/
             cp src/client/release/SalesGraph_${V}_${{ matrix.arch }}.dmg.blockmap out/
