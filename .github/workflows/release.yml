@@ -77,7 +77,7 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: 24
       - name: npm 11
         # npm 10 runs an implicit `node-gyp rebuild` for any package with a
         # binding.gyp; better-sqlite3 has one and ships prebuilds instead.
