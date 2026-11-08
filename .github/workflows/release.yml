@@ -102,8 +102,19 @@ jobs:
           echo "runner arch: $got (want $want)"
           test "$got" = "$want"
 
-      - working-directory: src/client
-        run: npm ci
+      - name: Install the client deps
+        working-directory: src/client
+        shell: bash
+        run: |
+          # The Electron binary is a GitHub Release asset, and that endpoint
+          # answers 504 under load; the failure surfaces as `npm ci` dying in
+          # `node install.js`. Try the canonical host first, then a mirror.
+          npm ci || {
+            echo "::warning::npm ci failed (Electron download?) — retrying via ELECTRON_MIRROR"
+            export ELECTRON_MIRROR="https://npmmirror.com/mirrors/electron/"
+            export ELECTRON_CUSTOM_DIR="{{ version }}"
+            npm ci
+          }
       - working-directory: src/client/agent-server
         run: npm ci
 
@@ -115,11 +126,22 @@ jobs:
         working-directory: src/client
         shell: bash
         run: |
-          if [ "${{ matrix.platform }}" = "win" ]; then
-            npm run dist:win
-          else
-            npm run dist:mac
-          fi
+          set -o pipefail
+          build() {
+            if [ "${{ matrix.platform }}" = "win" ]; then
+              npm run dist:win
+            else
+              npm run dist:mac
+            fi
+          }
+          # electron-builder fetches its own copy of Electron from the same
+          # GitHub Releases endpoint; a 504 there is not a build failure.
+          build || {
+            echo "::warning::installer build failed (Electron download?) — retrying via ELECTRON_MIRROR"
+            export ELECTRON_MIRROR="https://npmmirror.com/mirrors/electron/"
+            export ELECTRON_CUSTOM_DIR="{{ version }}"
+            build
+          }
 
       - name: Collect exactly what ships
         # The top-level files only: `client/release/**` also contains
