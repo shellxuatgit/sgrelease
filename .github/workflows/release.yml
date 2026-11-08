@@ -140,6 +140,9 @@ jobs:
             echo "::warning::installer build failed (Electron download?) — retrying via ELECTRON_MIRROR"
             export ELECTRON_MIRROR="https://npmmirror.com/mirrors/electron/"
             export ELECTRON_CUSTOM_DIR="{{ version }}"
+            # electron-builder's own tools (nsis, 7zip, dmgbuild) are GitHub
+            # Release assets too, and go through the same endpoint.
+            export ELECTRON_BUILDER_BINARIES_MIRROR="https://npmmirror.com/mirrors/electron-builder-binaries/"
             build
           }
 
